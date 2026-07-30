@@ -1,0 +1,21 @@
+# 고속 데이터 처리 및 ETL
+polars>=0.20.0
+connectorx>=0.4.0
+duckdb>=0.10.0
+pyarrow>=15.0.0
+fastparquet>=2024.2.0
+orjson>=3.9.0
+
+# 데이터 조작 및 SQL 파싱
+sqlglot>=23.0.0
+
+# DB 드라이버 및 ORM
+psycopg2-binary>=2.9.0
+pymysql>=1.1.0
+oracledb>=2.0.0
+sqlalchemy>=2.0.0
+
+# 보안 및 터미널 UI/진척도
+cryptography>=42.0.0
+rich>=13.0.0
+tqdm>=4.66.0

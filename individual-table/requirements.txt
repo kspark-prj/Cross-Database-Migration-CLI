@@ -1,0 +1,7 @@
+# Data processing & DB Connectors
+polars>=0.20.0
+connectorx>=0.3.2
+duckdb>=0.9.0
+
+# Optional / Performance Optimization
+pyarrow>=14.0.0
