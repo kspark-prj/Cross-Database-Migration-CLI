@@ -26,6 +26,9 @@ VeloxDB는 Python 기반으로 작성된 초고속, OOM 방지(Out-Of-Memory Saf
 - **Lock-Free 스캔**: 세션 연결 시 자동으로 `REPEATABLE READ` 또는 `READ COMMITTED` isolation 설정을 트리거하여 라이브 소스 DB 테이블에 락(Lock)을 전혀 유발하지 않습니다.
 - **O(1) 수치형 PK 범위 쿼리**: 수치형 단일 PK 컬럼의 경우, PK의 Min/Max 범위를 균등 분할하여 `WHERE pk >= X AND pk < Y` 인덱스 범위 검색 방식으로 처리를 안전하게 진행합니다. (성능 저하를 일으키는 SQL `OFFSET` 방식 철저 금지)
 - **커서 기반 키셋 페이지네이션 (비수치형 및 복합 PK)**: 단일 PK가 비수치형(String, DateTime 등)이거나 복합 PK(Composite PK)인 경우, 데이터를 정렬한 후 이전 청크의 마지막 레코드 ID(또는 복합 PK 값의 튜플)를 조건으로 사용해 `WHERE pk_col > last_pk` 방식으로 청크를 안전하게 쪼개고 슬라이싱(Keyset Pagination)합니다. 전체 PK 목록을 메모리에 로드하지 않아 메모리 부하(OOM)가 원천 방지됩니다.
+- **사전 카운트 쿼리(`COUNT(*)`) 실행 목적**:
+  - **청크 분할 수립 및 최적화**: 추출 전 테이블의 전체 행 수(`total_rows`)를 파악하여 `chunk_size` 대비 총 청크 수(`total_chunks`)를 미리 산정합니다. 데이터가 없는 빈 테이블은 즉시 추출을 스킵(Bypass)합니다.
+  - **정확한 진척도 UI 렌더링**: 전체 진행률(Overall Progress) 및 테이블별 진행 상태바를 CLI 화면에 정확한 퍼센트(%) 수치로 표현하기 위한 기준값으로 활용됩니다.
 
 ### 4. 시각화 스키마 DDL 적용 및 로그 컨트롤 (Unlogged/Nologging)
 
@@ -37,12 +40,13 @@ VeloxDB는 Python 기반으로 작성된 초고속, OOM 방지(Out-Of-Memory Saf
 ### 5. 100% 오프라인 정합성 검증 (Offline Integrity Verification)
 
 - **통합 무결성 검증 엔진 (`validate_all_tables`)**: 소스 DB와 연결을 해제한 상태에서, `DBValidator`가 전체 테이블의 청크 무결성 및 인덱스 생성을 일괄 검증합니다.
-- **수학적 MD5 32-bit 정수 합산 알고리즘**: Python/PostgreSQL/MySQL/Oracle 전체에 걸쳐 수치형 PK 범위별 해시 체크섬을 검증합니다.
-- 복합 PK(Composite PK)인 경우, 각 컬럼 값을 문자열로 형변환 후 결합(CONCAT 또는 `||`)한 가상 PK 값을 MD5 해싱 연산의 입력값으로 사용합니다.
-- **Postgres**: `SUM(('x' || substring(md5(CAST(pk AS TEXT)), 1, 8))::bit(32)::bigint)` (복합 PK는 `CONCAT(CAST(pk1 AS TEXT), CAST(pk2 AS TEXT))` 형식)
-- **MySQL**: `SUM(conv(substring(md5(CAST(pk AS CHAR)), 1, 8), 16, 10))` (복합 PK는 `CONCAT(CAST(pk1 AS CHAR), CAST(pk2 AS CHAR))` 형식)
-- **Oracle**: `SUM(to_number(substr(standard_hash(to_char(pk), 'MD5'), 1, 8), 'XXXXXXXX'))` (복합 PK는 `CAST(pk1 AS VARCHAR2(4000)) || CAST(pk2 AS VARCHAR2(4000))` 형식)
-- **Python/DuckDB**: `CAST(('0x' || substring(md5(CAST(pk AS VARCHAR)), 1, 8)) AS UBIGINT)` (복합 PK는 `CAST(pk1 AS VARCHAR) || CAST(pk2 AS VARCHAR)` 형식)
+- **PK 기반 체크섬 검증 알고리즘**: 데이터 적재 후 Target DB 측과 Source DB(Parquet 추출 시점) 간의 PK 체크섬을 대조합니다.
+  - **단일 수치형 PK(Integer 등)**: PK 값을 정수형(`BIGINT`)으로 변환한 뒤 **단순 합산(`SUM`)**하여 검증합니다.
+    - SQL (Target DB): `SUM(CAST(pk_col AS BIGINT))`
+    - Python (Source DB): `df.select(pl.col(pk_col).cast(pl.Int64).sum())`
+  - **비수치형 PK 및 복합 PK(Composite PK)**: PK 컬럼들을 문자열로 연결(`CONCAT` 또는 `||`)한 뒤, 해시 함수를 통해 변환한 해시값들의 총합을 체크섬으로 사용합니다.
+    - Python (Source DB): `df.select(concat_expr.hash(seed=0).sum())`
+    - DuckDB (고속 덤프): `SUM(crc32(concat_expr))`
 - **SQLAlchemy Inspector 연동**: Target DB에 실제로 생성된 인덱스 목록을 `inspect(engine)`을 통해 동적으로 수집하고 Source 메타데이터 인덱스 수와 일치하는지 자동으로 교차 검증합니다.
 - ** 차이점 핀포인트 추적**: 불일치 청크 발견 시 로컬 Parquet 파일 데이터와 대상 DB 데이터를 로컬 메모리에 올려 정밀 **Polars Diff** 검증을 수행하고, 최대 10건의 핀포인트 mismatch 상세 내역을 `mismatch_log.json`에 기록합니다. 복합 PK 테이블도 **Polars의 다중 컬럼 Join 및 Expression 매칭**을 통해 메모리 효율적이고 정확하게 차이점을 추적하고 기록합니다.
 
@@ -160,6 +164,34 @@ Table: batch_checkpoints (적재완료 - 0.02초) ━━━━━━━━━━
 Table: bulk_test_users (적재중...) ━━━━━━━━━━━━━━━━━━━╸━━━━━━━━━━━  50% Loaded chunk 250/500 297.15 MB
 [bold yellow]Overall Progress[/bold yellow] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100%
 ✓ Bulk loading completed. (Elapsed: 56.78s)
+
+---
+
+## 🔄 핵심 파이프라인 루프 및 처리 구조
+
+VeloxDB의 데이터 추출, 적재, 검증의 전체 단계는 청크(Chunk) 및 테이블 단위의 세밀한 루프 제어를 통해 안정적으로 진행됩니다.
+
+### 1. 데이터 추출 (Phase 1: Extract)
+* **테이블 내부 청크 단위 루프**: `DBExtractor.extract_table`
+  * 하나의 테이블 데이터를 나눈 청크 범위 목록(`ranges`)을 기준으로 루프를 돌며 데이터를 파일로 덤프하고 체크섬을 연산합니다.
+  * 루프 문: `for idx, range_info in enumerate(ranges):`
+* **전체 테이블 루프 (병렬)**: `main.py -> run_parallel_extraction`
+  * 스레드 풀(`ThreadPoolExecutor`)을 사용해 여러 테이블의 `extract_table` 작업을 병렬로 호출합니다.
+
+### 2. 데이터 적재 (Phase 2: Load)
+* **테이블 내부 청크 파일 루프**: `DBLoader.load_table_data`
+  * 저장된 Parquet 파티션 파일 목록(`part-*.parquet`)을 차례대로 읽는 루프를 돌면서 타겟 DB에 데이터 벌크 적재(`_bulk_insert_df`)를 실행합니다.
+  * 루프 문: `for idx, p_file in enumerate(parquet_files):`
+* **전체 테이블 루프 (병렬)**: `main.py -> run_parallel_load`
+  * 대상 테이블 목록을 대상으로 병렬 적재 세션을 관리합니다.
+
+### 3. 적재 완료 후 검증 (Phase 2: Validate)
+* **테이블 내부 청크 체크섬 검증 루프**: `DBValidator.validate_table`
+  * `source_checksums.json`에서 읽어온 소스 DB의 청크별 체크섬 정보를 기준으로 루프를 수행하며 타겟 DB의 집계 결과와 대조합니다.
+  * 루프 문: `for chunk in chunks:`
+* **전체 테이블 검증 루프**: `DBValidator.validate_all_tables`
+  * 메타데이터 내 테이블 목록을 순회하며 테이블마다 검증 함수를 실행시킵니다.
+  * 루프 문: `for table in tables:`
 
 ---
 
