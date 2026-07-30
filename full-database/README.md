@@ -27,8 +27,8 @@ VeloxDB는 Python 기반으로 작성된 초고속, OOM 방지(Out-Of-Memory Saf
 - **O(1) 수치형 PK 범위 쿼리**: 수치형 단일 PK 컬럼의 경우, PK의 Min/Max 범위를 균등 분할하여 `WHERE pk >= X AND pk < Y` 인덱스 범위 검색 방식으로 처리를 안전하게 진행합니다. (성능 저하를 일으키는 SQL `OFFSET` 방식 철저 금지)
 - **커서 기반 키셋 페이지네이션 (비수치형 및 복합 PK)**: 단일 PK가 비수치형(String, DateTime 등)이거나 복합 PK(Composite PK)인 경우, 데이터를 정렬한 후 이전 청크의 마지막 레코드 ID(또는 복합 PK 값의 튜플)를 조건으로 사용해 `WHERE pk_col > last_pk` 방식으로 청크를 안전하게 쪼개고 슬라이싱(Keyset Pagination)합니다. 전체 PK 목록을 메모리에 로드하지 않아 메모리 부하(OOM)가 원천 방지됩니다.
 - **사전 카운트 쿼리(`COUNT(*)`) 실행 목적**:
-  - **청크 분할 수립 및 최적화**: 추출 전 테이블의 전체 행 수(`total_rows`)를 파악하여 `chunk_size` 대비 총 청크 수(`total_chunks`)를 미리 산정합니다. 데이터가 없는 빈 테이블은 즉시 추출을 스킵(Bypass)합니다.
-  - **정확한 진척도 UI 렌더링**: 전체 진행률(Overall Progress) 및 테이블별 진행 상태바를 CLI 화면에 정확한 퍼센트(%) 수치로 표현하기 위한 기준값으로 활용됩니다.
+    - **청크 분할 수립 및 최적화**: 추출 전 테이블의 전체 행 수(`total_rows`)를 파악하여 `chunk_size` 대비 총 청크 수(`total_chunks`)를 미리 산정합니다. 데이터가 없는 빈 테이블은 즉시 추출을 스킵(Bypass)합니다.
+    - **정확한 진척도 UI 렌더링**: 전체 진행률(Overall Progress) 및 테이블별 진행 상태바를 CLI 화면에 정확한 퍼센트(%) 수치로 표현하기 위한 기준값으로 활용됩니다.
 
 ### 4. 시각화 스키마 DDL 적용 및 로그 컨트롤 (Unlogged/Nologging)
 
@@ -41,12 +41,12 @@ VeloxDB는 Python 기반으로 작성된 초고속, OOM 방지(Out-Of-Memory Saf
 
 - **통합 무결성 검증 엔진 (`validate_all_tables`)**: 소스 DB와 연결을 해제한 상태에서, `DBValidator`가 전체 테이블의 청크 무결성 및 인덱스 생성을 일괄 검증합니다.
 - **PK 기반 체크섬 검증 알고리즘**: 데이터 적재 후 Target DB 측과 Source DB(Parquet 추출 시점) 간의 PK 체크섬을 대조합니다.
-  - **단일 수치형 PK(Integer 등)**: PK 값을 정수형(`BIGINT`)으로 변환한 뒤 **단순 합산(`SUM`)**하여 검증합니다.
-    - SQL (Target DB): `SUM(CAST(pk_col AS BIGINT))`
-    - Python (Source DB): `df.select(pl.col(pk_col).cast(pl.Int64).sum())`
-  - **비수치형 PK 및 복합 PK(Composite PK)**: PK 컬럼들을 문자열로 연결(`CONCAT` 또는 `||`)한 뒤, 해시 함수를 통해 변환한 해시값들의 총합을 체크섬으로 사용합니다.
-    - Python (Source DB): `df.select(concat_expr.hash(seed=0).sum())`
-    - DuckDB (고속 덤프): `SUM(crc32(concat_expr))`
+    - **단일 수치형 PK(Integer 등)**: PK 값을 정수형(`BIGINT`)으로 변환한 뒤 **단순 합산(`SUM`)**하여 검증합니다.
+        - SQL (Target DB): `SUM(CAST(pk_col AS BIGINT))`
+        - Python (Source DB): `df.select(pl.col(pk_col).cast(pl.Int64).sum())`
+    - **비수치형 PK 및 복합 PK(Composite PK)**: PK 컬럼들을 문자열로 연결(`CONCAT` 또는 `||`)한 뒤, 해시 함수를 통해 변환한 해시값들의 총합을 체크섬으로 사용합니다.
+        - Python (Source DB): `df.select(concat_expr.hash(seed=0).sum())`
+        - DuckDB (고속 덤프): `SUM(crc32(concat_expr))`
 - **SQLAlchemy Inspector 연동**: Target DB에 실제로 생성된 인덱스 목록을 `inspect(engine)`을 통해 동적으로 수집하고 Source 메타데이터 인덱스 수와 일치하는지 자동으로 교차 검증합니다.
 - ** 차이점 핀포인트 추적**: 불일치 청크 발견 시 로컬 Parquet 파일 데이터와 대상 DB 데이터를 로컬 메모리에 올려 정밀 **Polars Diff** 검증을 수행하고, 최대 10건의 핀포인트 mismatch 상세 내역을 `mismatch_log.json`에 기록합니다. 복합 PK 테이블도 **Polars의 다중 컬럼 Join 및 Expression 매칭**을 통해 메모리 효율적이고 정확하게 차이점을 추적하고 기록합니다.
 
@@ -117,7 +117,7 @@ python main.py --mode extract --source-uri "postgresql://postgres:root@127.0.0.1
 이동 매체 또는 타겟 서버 환경에서 대상 DB에만 연결하여 DDL 트리 시각화 생성, 데이터 단일 파일 단위 벌크 로드, 종합 검증(`validate_all_tables`) 및 시퀀스 최적화를 수행합니다:
 
 ```bash
-python main.py --mode load --target-uri "postgresql://postgres:root@127.0.0.1:5432/my-app-db" --output-dir "./mig_assets" --max-workers 3 --cleanup
+python main.py --mode load --target-uri "postgresql://postgres:root@127.0.0.1:5432/target_db" --output-dir "./mig_assets" --max-workers 3 --cleanup
 
 ```
 
@@ -200,23 +200,24 @@ VeloxDB의 데이터 추출, 적재, 검증의 전체 단계는 청크(Chunk) �
 마이그레이션 출력 디렉터리(`--output-dir`) 내부에 아래와 같은 독립 자산들이 통합 관리됩니다.
 
 ```
-migration_data/
-├── schema.sql                   # 원본 소스 DB 테이블 DDL 정보
-├── metadata.json                # 컬럼 목록, 인덱스 정보, FK 관계가 담긴 번역용 JSON 메타
-├── source_checksums.json        # 청크 단위 PK 범위 및 MD5 해시 통계 (오프라인 검증용)
-├── migration_progress.json      # Phase 1 추출 체크포인트
-├── migration_progress_load.json # Phase 2 적재 체크포인트
-├── mismatch_log.json            # 정합성 오류 발생 시 차이 데이터 샘플 로그 (mismatch 존재 시 자동 생성)
-├── migration_report.md          # 마이그레이션 최종 검증 종합 리포트
-└── parquet/                     # 물리적 분할 저장된 Parquet 파티션 폴더
-    ├── users/
-    │   ├── part-0000.parquet
-    │   └── part-0001.parquet
-    └── orders/
-        ├── part-0000.parquet
-        └── part-0001.parquet
 
-```
+migration_data/
+├── schema.sql # 원본 소스 DB 테이블 DDL 정보
+├── metadata.json # 컬럼 목록, 인덱스 정보, FK 관계가 담긴 번역용 JSON 메타
+├── source_checksums.json # 청크 단위 PK 범위 및 MD5 해시 통계 (오프라인 검증용)
+├── migration_progress.json # Phase 1 추출 체크포인트
+├── migration_progress_load.json # Phase 2 적재 체크포인트
+├── mismatch_log.json # 정합성 오류 발생 시 차이 데이터 샘플 로그 (mismatch 존재 시 자동 생성)
+├── migration_report.md # 마이그레이션 최종 검증 종합 리포트
+└── parquet/ # 물리적 분할 저장된 Parquet 파티션 폴더
+├── users/
+│ ├── part-0000.parquet
+│ └── part-0001.parquet
+└── orders/
+├── part-0000.parquet
+└── part-0001.parquet
+
+````
 
 ---
 
@@ -272,7 +273,7 @@ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
   AND c.relkind = 'r'
   AND relname = '테이블명'; -- 확인하실 테이블명 입력
 
-```
+````
 
 ### 시퀀스(Auto Increment) 번호 맞추기 (신규 데이터 INSERT 시 중복 에러 방지)
 

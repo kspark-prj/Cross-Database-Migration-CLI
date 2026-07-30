@@ -1,38 +1,114 @@
 import glob
 import os
-import re
-import traceback
+import time
 
+import duckdb
 import orjson
-import polars as pl
-from rich.console import Console
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, text
 
 
 class DBLoader:
-    def __init__(self, db_config, data_dir, max_workers=4, resume=False, unlogged=True):
+    def __init__(
+        self,
+        db_config,
+        data_dir,
+        chunk_size=100000,
+        delay_ms=0,
+        max_workers=4,
+        resume=False,
+        cleanup=False,
+        source_dialect="mysql",
+    ):
         self.config = db_config
         self.data_dir = data_dir
+        self.chunk_size = chunk_size
+        self.delay_ms = delay_ms
         self.max_workers = max_workers
         self.resume = resume
-        self.unlogged = unlogged
-        self.console = Console()
+        self.cleanup = cleanup
 
-        # Paths
+        # Dialect 이름 정규화 (postgresql/postgres -> postgres)
+        self.source_dialect = self._normalize_dialect(source_dialect)
+
         self.parquet_dir = os.path.join(data_dir, "parquet")
         self.metadata_path = os.path.join(data_dir, "metadata.json")
         self.schema_path = os.path.join(data_dir, "schema.sql")
-        self.progress_path = os.path.join(data_dir, "migration_progress.json")
+        self.progress_path = os.path.join(data_dir, "load_progress.json")
 
-        self.metadata = self._load_metadata()
         self.progress = self._load_progress()
-        self.engine = create_engine(self.config.get_sqlalchemy_url())
 
-    def _load_metadata(self):
-        if os.path.exists(self.metadata_path):
-            with open(self.metadata_path, "rb") as f:
-                return orjson.loads(f.read())
-        return {}
+        # 1. Target DB에 DDL 스키마 자동 변환 및 사전 적용
+        self._apply_schema_if_needed()
+
+    @staticmethod
+    def _normalize_dialect(dialect_str):
+        """sqlglot 및 DuckDB 호환용 Dialect 이름 정규화"""
+        d = str(dialect_str).lower().strip()
+        if d in ["postgresql", "postgres", "pg"]:
+            return "postgres"
+        if d in ["mysql", "mariadb"]:
+            return "mysql"
+        if d in ["sqlite", "sqlite3"]:
+            return "sqlite"
+        if d in ["oracle", "oracledb"]:
+            return "oracle"
+        if d in ["mssql", "sqlserver"]:
+            return "tsql"
+        return d
+
+    def _apply_schema_if_needed(self):
+        """schema.sql의 DDL을 Target DB Dialect로 변환(Transpile)하여 테이블 생성"""
+        if not os.path.exists(self.schema_path):
+            return
+
+        raw_target_dialect = getattr(self.config, "dialect", "postgres")
+        target_dialect = self._normalize_dialect(raw_target_dialect)
+
+        try:
+            with open(self.schema_path, "r", encoding="utf-8") as f:
+                raw_schema_sql = f.read()
+
+            if not raw_schema_sql.strip():
+                return
+
+            translated_statements = []
+
+            # Source와 Target의 Dialect가 다르면 sqlglot으로 DDL 문법 및 타입 변환
+            if self.source_dialect != target_dialect:
+                try:
+                    import sqlglot
+
+                    translated_statements = sqlglot.transpile(
+                        raw_schema_sql,
+                        read=self.source_dialect,
+                        write=target_dialect,
+                        pretty=True,
+                    )
+                    print(f"🔄 [Schema Transpiler] DDL 변환 완료: {self.source_dialect.upper()} ➡️ {target_dialect.upper()}")
+                except ImportError:
+                    print("⚠️  [Schema Warning] sqlglot 미설치로 원본 DDL을 실행합니다. (pip install sqlglot)")
+                    translated_statements = [raw_schema_sql]
+                except Exception as trans_err:
+                    print(f"⚠️  [Schema Transpile Warning] DDL 자동 변환 우회 (원본 구문 실행): {trans_err}")
+                    translated_statements = [raw_schema_sql]
+            else:
+                translated_statements = [raw_schema_sql]
+
+            # 변환된 DDL을 Target DB에 실행
+            engine = create_engine(self.config.get_sqlalchemy_url())
+            with engine.begin() as conn:
+                for stmt in translated_statements:
+                    for single_stmt in stmt.split(";"):
+                        clean_stmt = single_stmt.strip()
+                        if clean_stmt:
+                            try:
+                                conn.execute(text(clean_stmt))
+                            except Exception:
+                                pass
+            engine.dispose()
+
+        except Exception as e:
+            print(f"⚠️  [Schema Notice] DDL 사전 준비 안내: {e}")
 
     def _load_progress(self):
         if self.resume and os.path.exists(self.progress_path):
@@ -50,322 +126,168 @@ class DBLoader:
         with open(self.progress_path, "wb") as f:
             f.write(orjson.dumps(data, option=orjson.OPT_INDENT_2))
 
-    def check_duckdb_support(self):
-        try:
-            import duckdb
+    def get_tables_to_load(self):
+        if not os.path.exists(self.parquet_dir):
+            return []
 
-            con = duckdb.connect()
-            dialect = self.config.dialect
-            if dialect == "postgresql":
-                con.execute("INSTALL postgres; LOAD postgres;")
-            elif dialect == "mysql":
-                con.execute("INSTALL mysql; LOAD mysql;")
-            return True, f"DuckDB native support available for {dialect}"
-        except Exception as e:
-            return False, f"DuckDB fallback to DBAPI (Reason: {e})"
+        tables = [d for d in os.listdir(self.parquet_dir) if os.path.isdir(os.path.join(self.parquet_dir, d)) and not d.startswith("__")]
+        return sorted(tables)
 
-    def prepare_schema(self, source_dialect: str):
-        """기본 스키마 DDL 생성 및 기존 데이터 초기화를 진행하며 생성 목록을 트리 형태로 출력합니다."""
-        inspector = inspect(self.engine)
-        existing_tables = inspector.get_table_names()
-
-        tables = [t for t in self.metadata.keys() if not t.startswith("__")]
-
-        with self.engine.begin() as conn:
-            for table in tables:
-                t_meta = self.metadata[table]
-                cols = t_meta.get("columns", [])
-
-                self.console.print(f" 📦 [bold cyan]Table: {table}[/bold cyan]")
-                tree_items = []
-
-                if table in existing_tables:
-                    # 재실행 시 중복 적재 방지를 위해 TRUNCATE 수행
-                    if not self.resume:
-                        try:
-                            conn.execute(text(f"TRUNCATE TABLE {table} CASCADE;"))
-                            tree_items.append(
-                                "🧹 [dim]Existing table found: Truncated data (CASCADE)[/dim]"
-                            )
-                        except Exception:
-                            conn.execute(text(f"DELETE FROM {table};"))
-                            tree_items.append("🧹 [dim]Existing table found: Deleted data[/dim]")
-                    else:
-                        tree_items.append(
-                            "ℹ️  [dim]Existing table found: Resume mode (Skipped truncate)[/dim]"
-                        )
-                else:
-                    # 테이블 생성 DDL
-                    col_defs = []
-                    for c in cols:
-                        col_name = c["name"]
-                        col_type = self._map_data_type(
-                            c["type"], source_dialect, self.config.dialect
-                        )
-                        nullable = "" if c.get("nullable", True) else " NOT NULL"
-                        col_defs.append(f'  "{col_name}" {col_type}{nullable}')
-
-                    unlogged_str = ""
-                    unlogged_label = ""
-                    if self.unlogged and self.config.dialect == "postgresql":
-                        unlogged_str = "UNLOGGED "
-                        unlogged_label = " [bold yellow](UNLOGGED)[/bold yellow]"
-
-                    create_sql = (
-                        f"CREATE {unlogged_str}TABLE {table} (\n" + ",\n".join(col_defs) + "\n);"
-                    )
-                    conn.execute(text(create_sql))
-                    tree_items.append(
-                        f"🏗️  [bold green]Created Table[/bold green]{unlogged_label} ({len(cols)} columns)"
-                    )
-
-                # 트리 형태로 출력
-                total_items = len(tree_items)
-                for idx, item in enumerate(tree_items):
-                    is_last = idx == total_items - 1
-                    branch = "   └── " if is_last else "   ├── "
-                    self.console.print(f"{branch}{item}")
-
-                self.console.print()
-
-    def _map_data_type(self, src_type: str, src_dialect: str, tgt_dialect: str) -> str:
-        src_type_upper = src_type.upper()
-
-        if tgt_dialect == "postgresql":
-            if "INT" in src_type_upper and "BIGINT" not in src_type_upper:
-                return "INTEGER"
-            if "DATETIME" in src_type_upper or "TIMESTAMP" in src_type_upper:
-                return "TIMESTAMP"
-            if "VARCHAR" in src_type_upper or "TEXT" in src_type_upper:
-                return src_type
-            if "BLOB" in src_type_upper:
-                return "BYTEA"
-
-        elif tgt_dialect == "mysql":
-            if "BYTEA" in src_type_upper:
-                return "LONGBLOB"
-            if "TIMESTAMP" in src_type_upper:
-                return "DATETIME"
-
-        return src_type
-
-    def load_table_data(self, table: str, ui_progress_callback=None):
-        if table in self.progress and self.progress[table].get("status") == "completed":
+    def load_table(self, table_name, ui_progress_callback=None):
+        table_parquet_dir = os.path.join(self.parquet_dir, table_name)
+        if not os.path.exists(table_parquet_dir):
             if ui_progress_callback:
-                ui_progress_callback(table, 0, 0, skipped=True)
+                ui_progress_callback(table_name, finished=True)
             return
 
-        table_dir = os.path.join(self.parquet_dir, table)
-        if not os.path.exists(table_dir):
+        if self.resume and self.progress.get(table_name, {}).get("status") == "completed":
+            if ui_progress_callback:
+                ui_progress_callback(table_name, skipped=True)
             return
 
-        parquet_files = sorted(glob.glob(os.path.join(table_dir, "part-*.parquet")))
-        if not parquet_files:
-            return
+        if table_name not in self.progress or self.cleanup:
+            self.progress[table_name] = {"status": "in_progress", "loaded_files": []}
+            self._save_progress()
+
+        parquet_files = sorted(glob.glob(os.path.join(table_parquet_dir, "*.parquet")))
+        total_files = len(parquet_files)
+        accumulated_rows = 0
+
+        raw_target_dialect = getattr(self.config, "dialect", "postgres")
+        target_dialect = self._normalize_dialect(raw_target_dialect)
+
+        # ---------------------------------------------------------------------
+        # Mode A: PostgreSQL / MySQL (DuckDB C++ Native Extension - 초고속 적재)
+        # ---------------------------------------------------------------------
+        if target_dialect in ["postgres", "mysql"]:
+            duckdb_ext_name = target_dialect  # 'postgres' 또는 'mysql'
+            engine_name = f"DuckDB Native C++ Extension ({duckdb_ext_name.upper()})"
+            print(f"🚀 [Engine: {engine_name}] '{table_name}' 적재 시작...")
+
+            con = duckdb.connect(database=":memory:")
+            try:
+                # DuckDB 익스텐션 설치 및 로드
+                con.execute(f"INSTALL {duckdb_ext_name}; LOAD {duckdb_ext_name};")
+
+                raw_url = self.config.get_sqlalchemy_url()
+                if "://" in raw_url and "+" in raw_url.split("://")[0]:
+                    dialect_prefix = raw_url.split("://")[0].split("+")[0]
+                    clean_url = f"{dialect_prefix}://{raw_url.split('://')[1]}"
+                else:
+                    clean_url = raw_url
+
+                duckdb_type = "POSTGRES" if duckdb_ext_name == "postgres" else "MYSQL"
+                con.execute(f"ATTACH '{clean_url}' AS target_db (TYPE {duckdb_type});")
+
+                if self.cleanup:
+                    try:
+                        con.execute(f"TRUNCATE TABLE target_db.{table_name};")
+                    except Exception:
+                        pass
+
+                for idx, p_file in enumerate(parquet_files, start=1):
+                    file_name = os.path.basename(p_file)
+
+                    if self.resume and not self.cleanup and file_name in self.progress[table_name].get("loaded_files", []):
+                        continue
+
+                    try:
+                        row_count = con.execute(f"SELECT count(*) FROM read_parquet('{p_file}')").fetchone()[0]
+                        file_size = os.path.getsize(p_file) if os.path.exists(p_file) else 0
+
+                        if row_count > 0:
+                            con.execute(f"INSERT INTO target_db.{table_name} SELECT * FROM read_parquet('{p_file}')")
+
+                        accumulated_rows += row_count
+                        self.progress[table_name]["loaded_files"].append(file_name)
+                        self._save_progress()
+
+                        if ui_progress_callback:
+                            ui_progress_callback(
+                                table_name,
+                                curr_file=idx,
+                                total_files=total_files,
+                                rows=accumulated_rows,
+                                bytes_size=file_size,
+                            )
+
+                        if self.delay_ms > 0:
+                            time.sleep(self.delay_ms / 1000.0)
+
+                    except Exception as e:
+                        raise RuntimeError(f"Error loading {p_file} into {table_name} via {engine_name}: {e}")
+
+            finally:
+                con.close()
+
+        # ---------------------------------------------------------------------
+        # Mode B: Oracle, MSSQL, SQLite 등 (Polars/SQLAlchemy Batch - 호환성 적재)
+        # ---------------------------------------------------------------------
+        else:
+            import polars as pl
+
+            engine_name = f"SQLAlchemy Bulk Driver ({target_dialect.upper()})"
+            print(f"📦 [Engine: {engine_name}] '{table_name}' 적재 시작...")
+
+            engine = create_engine(self.config.get_sqlalchemy_url())
+
+            if self.cleanup:
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text(f"TRUNCATE TABLE {table_name}"))
+                except Exception:
+                    pass
+
+            for idx, p_file in enumerate(parquet_files, start=1):
+                file_name = os.path.basename(p_file)
+
+                if self.resume and not self.cleanup and file_name in self.progress[table_name].get("loaded_files", []):
+                    continue
+
+                try:
+                    df = pl.read_parquet(p_file)
+                    row_count = df.height
+                    file_size = os.path.getsize(p_file) if os.path.exists(p_file) else 0
+
+                    if row_count > 0:
+                        df.to_pandas().to_sql(
+                            name=table_name,
+                            con=engine,
+                            if_exists="append",
+                            index=False,
+                            chunksize=10000,
+                            method="multi",
+                        )
+
+                    accumulated_rows += row_count
+                    self.progress[table_name]["loaded_files"].append(file_name)
+                    self._save_progress()
+
+                    if ui_progress_callback:
+                        ui_progress_callback(
+                            table_name,
+                            curr_file=idx,
+                            total_files=total_files,
+                            rows=accumulated_rows,
+                            bytes_size=file_size,
+                        )
+
+                    if self.delay_ms > 0:
+                        time.sleep(self.delay_ms / 1000.0)
+
+                except Exception as e:
+                    raise RuntimeError(f"Error loading {p_file} into {table_name} via {engine_name}: {e}")
+
+            engine.dispose()
+
+        self.progress[table_name]["status"] = "completed"
+        self._save_progress()
 
         if ui_progress_callback:
             ui_progress_callback(
-                table,
-                0,
-                0,
-                chunk_idx=0,
-                total_chunks=len(parquet_files)
+                table_name,
+                curr_file=total_files,
+                total_files=total_files,
+                rows=accumulated_rows,
+                finished=True,
             )
-
-        if table not in self.progress:
-            self.progress[table] = {"status": "in_progress", "completed_files": []}
-
-        for idx, p_file in enumerate(parquet_files):
-            file_name = os.path.basename(p_file)
-            if file_name in self.progress[table]["completed_files"]:
-                continue
-
-            df = pl.read_parquet(p_file)
-            row_count = df.height
-            file_size = os.path.getsize(p_file)
-
-            # 💡 p_file 경로를 직접 넘겨 단일 파일만 적재
-            self._bulk_insert_df(table, df, p_file)
-
-            self.progress[table]["completed_files"].append(file_name)
-            self._save_progress()
-
-            if ui_progress_callback:
-                ui_progress_callback(
-                    table,
-                    row_count,
-                    file_size,
-                    chunk_idx=idx + 1,
-                    total_chunks=len(parquet_files)
-                )
-
-        self.progress[table]["status"] = "completed"
-        self._save_progress()
-
-    def _bulk_insert_df(self, table: str, df: pl.DataFrame, p_file: str):
-        dialect = self.config.dialect
-
-        try:
-            import duckdb
-
-            con = duckdb.connect()
-            dsn = self.config.get_duckdb_dsn()
-            # 💡 *.parquet 대신 전달받은 p_file 경로만 사용하도록 수정!
-            p_path = p_file.replace("\\", "/")
-
-            if dialect == "postgresql":
-                con.execute("INSTALL postgres; LOAD postgres;")
-                con.execute(f"ATTACH '{dsn}' AS tgt (TYPE postgres);")
-                con.execute(f"INSERT INTO tgt.{table} SELECT * FROM read_parquet('{p_path}');")
-                return
-            elif dialect == "mysql":
-                con.execute("INSTALL mysql; LOAD mysql;")
-                con.execute(f"ATTACH '{dsn}' AS tgt (TYPE mysql);")
-                con.execute(f"INSERT INTO tgt.{table} SELECT * FROM read_parquet('{p_path}');")
-                return
-        except Exception:
-            pass
-
-        with self.engine.begin() as conn:
-            records = df.to_dicts()
-            if records:
-                cols = list(records[0].keys())
-                placeholders = ", ".join([f":{c}" for c in cols])
-                col_names = ", ".join([f'"{c}"' for c in cols])
-                sql = f"INSERT INTO {table} ({col_names}) VALUES ({placeholders})"
-                conn.execute(text(sql), records)
-
-    def restore_constraints_and_indexes(self, source_dialect: str):
-        """각 DDL을 트랜잭션 세이브포인트로 격리하여, 앞선 실패와 상관없이 SET LOGGED까지 확실하게 실행 및 출력합니다."""
-        tables = [t for t in self.metadata.keys() if not t.startswith("__")]
-
-        with self.engine.begin() as conn:
-            for table in tables:
-                t_meta = self.metadata[table]
-                pks = t_meta.get("primary_keys", [])
-                indexes = t_meta.get("indexes", [])
-                fks = t_meta.get("foreign_keys", [])
-
-                self.console.print(f" 📦 [bold cyan]Table: {table}[/bold cyan]")
-                tree_items = []
-
-                # 1. Primary Key 복원
-                if pks:
-                    pk_name = f"pk_{table}"
-                    pk_cols = ", ".join([f'"{c}"' for c in pks])
-                    try:
-                        conn.execute(text("SAVEPOINT sp_pk"))
-                        conn.execute(
-                            text(
-                                f'ALTER TABLE {table} ADD CONSTRAINT "{pk_name}" PRIMARY KEY ({pk_cols})'
-                            )
-                        )
-                        conn.execute(text("RELEASE SAVEPOINT sp_pk"))
-                        tree_items.append(
-                            f"🔑 [bold yellow]Primary Key[/bold yellow]: {pk_name} ({', '.join(pks)})"
-                        )
-                    except Exception:
-                        conn.execute(text("ROLLBACK TO SAVEPOINT sp_pk"))
-                        tree_items.append(
-                            f"🔑 [grey50]Primary Key: {pk_name} (Already exists or skipped)[/grey50]"
-                        )
-
-                # 2. Indexes 복원
-                if indexes:
-                    for idx_idx, idx in enumerate(indexes):
-                        sp_name = f"sp_idx_{idx_idx}"
-                        idx_name = idx.get("name") or f"idx_{table}_{'_'.join(idx['columns'])}"
-                        unique_str = "UNIQUE " if idx.get("unique") else ""
-                        cols_str = ", ".join([f'"{c}"' for c in idx["columns"]])
-                        try:
-                            conn.execute(text(f"SAVEPOINT {sp_name}"))
-                            conn.execute(
-                                text(
-                                    f'CREATE {unique_str}INDEX "{idx_name}" ON {table} ({cols_str})'
-                                )
-                            )
-                            conn.execute(text(f"RELEASE SAVEPOINT {sp_name}"))
-                            tree_items.append(
-                                f"🔍 [bold blue]Index[/bold blue]: {idx_name} ({', '.join(idx['columns'])}) [{unique_str.strip() or 'NON-UNIQUE'}]"
-                            )
-                        except Exception:
-                            conn.execute(text(f"ROLLBACK TO SAVEPOINT {sp_name}"))
-                            tree_items.append(
-                                f"🔍 [grey50]Index: {idx_name} (Already exists or skipped)[/grey50]"
-                            )
-
-                # 3. Foreign Keys 복원
-                if fks:
-                    for fk_idx, fk in enumerate(fks):
-                        sp_name = f"sp_fk_{fk_idx}"
-                        fk_name = (
-                            fk.get("name") or f"fk_{table}_{'_'.join(fk['constrained_columns'])}"
-                        )
-                        cols_str = ", ".join([f'"{c}"' for c in fk["constrained_columns"]])
-                        ref_cols_str = ", ".join([f'"{c}"' for c in fk["referred_columns"]])
-                        ref_table = fk["referred_table"]
-
-                        try:
-                            conn.execute(text(f"SAVEPOINT {sp_name}"))
-                            conn.execute(
-                                text(
-                                    f'ALTER TABLE {table} ADD CONSTRAINT "{fk_name}" FOREIGN KEY ({cols_str}) REFERENCES {ref_table} ({ref_cols_str})'
-                                )
-                            )
-                            conn.execute(text(f"RELEASE SAVEPOINT {sp_name}"))
-                            tree_items.append(
-                                f"🔗 [bold magenta]Foreign Key[/bold magenta]: {fk_name} ({', '.join(fk['constrained_columns'])}) ➔ {ref_table}({', '.join(fk['referred_columns'])})"
-                            )
-                        except Exception:
-                            conn.execute(text(f"ROLLBACK TO SAVEPOINT {sp_name}"))
-                            tree_items.append(
-                                f"🔗 [grey50]Foreign Key: {fk_name} (Skipped)[/grey50]"
-                            )
-
-                # 4. Sequence / Auto-Increment 값 현행화
-                if self.config.dialect == "postgresql":
-                    for col in t_meta.get("columns", []):
-                        if col.get("auto_increment") or "INT" in col["type"].upper():
-                            if pks and col["name"] in pks:
-                                try:
-                                    conn.execute(text("SAVEPOINT sp_seq"))
-                                    seq_res = conn.execute(
-                                        text(
-                                            f"SELECT pg_get_serial_sequence('{table}', '{col['name']}')"
-                                        )
-                                    ).fetchone()
-                                    if seq_res and seq_res[0]:
-                                        seq_name = seq_res[0]
-                                        conn.execute(
-                                            text(
-                                                f"SELECT setval('{seq_name}', COALESCE((SELECT MAX(\"{col['name']}\") FROM {table}), 1))"
-                                            )
-                                        )
-                                        tree_items.append(
-                                            f"🔢 [bold green]Sequence Reset[/bold green]: {seq_name} ➔ MAX({col['name']})"
-                                        )
-                                    conn.execute(text("RELEASE SAVEPOINT sp_seq"))
-                                except Exception:
-                                    conn.execute(text("ROLLBACK TO SAVEPOINT sp_seq"))
-
-                # 5. SET UNLOGGED -> LOGGED 변경 (독립 SAVEPOINT 적용)
-                if self.unlogged and self.config.dialect == "postgresql":
-                    try:
-                        conn.execute(text("SAVEPOINT sp_logged"))
-                        conn.execute(text(f"ALTER TABLE {table} SET LOGGED"))
-                        conn.execute(text("RELEASE SAVEPOINT sp_logged"))
-                        tree_items.append("🛡️  [dim]Table persistence updated: SET LOGGED[/dim]")
-                    except Exception as e:
-                        conn.execute(text("ROLLBACK TO SAVEPOINT sp_logged"))
-                        tree_items.append(
-                            f"🛡️  [grey50]Table persistence update failed: {e}[/grey50]"
-                        )
-
-                # 트리 출력 처리
-                total_items = len(tree_items)
-                for idx, item in enumerate(tree_items):
-                    is_last = idx == total_items - 1
-                    branch = "   └── " if is_last else "   ├── "
-                    self.console.print(f"{branch}{item}")
-
-                self.console.print()
