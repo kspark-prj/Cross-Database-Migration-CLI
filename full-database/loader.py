@@ -163,10 +163,19 @@ class DBLoader:
         if not parquet_files:
             return
 
+        if ui_progress_callback:
+            ui_progress_callback(
+                table,
+                0,
+                0,
+                chunk_idx=0,
+                total_chunks=len(parquet_files)
+            )
+
         if table not in self.progress:
             self.progress[table] = {"status": "in_progress", "completed_files": []}
 
-        for p_file in parquet_files:
+        for idx, p_file in enumerate(parquet_files):
             file_name = os.path.basename(p_file)
             if file_name in self.progress[table]["completed_files"]:
                 continue
@@ -182,7 +191,13 @@ class DBLoader:
             self._save_progress()
 
             if ui_progress_callback:
-                ui_progress_callback(table, row_count, file_size)
+                ui_progress_callback(
+                    table,
+                    row_count,
+                    file_size,
+                    chunk_idx=idx + 1,
+                    total_chunks=len(parquet_files)
+                )
 
         self.progress[table]["status"] = "completed"
         self._save_progress()

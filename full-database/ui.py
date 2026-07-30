@@ -12,8 +12,23 @@ from rich.progress import (
     TextColumn,
     TimeRemainingColumn,
     TransferSpeedColumn,
+    ProgressColumn,
 )
 from rich.table import Table
+from rich.text import Text
+
+
+class ChunkProgressColumn(ProgressColumn):
+    def render(self, task):
+        chunk_str = task.fields.get("chunk_str", "")
+        return Text(chunk_str, style="progress.download")
+
+
+class CurrentSizeColumn(ProgressColumn):
+    def render(self, task):
+        completed_bytes = task.fields.get("completed_bytes", 0)
+        megabytes = completed_bytes / (1024 * 1024)
+        return Text(f"{megabytes:.2f} MB", style="progress.download")
 
 
 class MigrationUI:
@@ -67,23 +82,26 @@ class MigrationUI:
         :param tables: 대상 테이블 리스트
         :param table_sizes: 테이블별 예상 전체 바이트 용량 {table_name: bytes}
         """
+        is_extract = "Extracting" in title
+        done_verb = "Extracted" if is_extract else "Loaded"
+
         progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(bar_width=30),
-            TaskProgressColumn(),  # % 진행률 표시
-            DownloadColumn(),  # 현재 용량 / 전체 용량 (예: 11.9/48.5 MB)
-            TransferSpeedColumn(),  # 전송 속도 (예: 5.2 MB/s)
-            TimeRemainingColumn(),  # 남은 예상 시간 (ETA)
+            TaskProgressColumn(),
+            ChunkProgressColumn(),  # "Extracted chunk 7/500" 형태로 커스텀 표시
+            CurrentSizeColumn(),    # "? 0:00:00" 대신 현재까지의 용량을 MB 단위로 표시
             console=self.console,
         )
 
         tasks = {}
         for table in tables:
-            total_bytes = table_sizes.get(table, 0)
-            # total_bytes가 0인 경우 None으로 설정되어 dynamic 처리 가능하도록 조치
             tasks[table] = progress.add_task(
-                f"Table: {table}", total=total_bytes if total_bytes > 0 else None
+                f"Table: {table}", 
+                total=None,
+                chunk_str="",
+                completed_bytes=0
             )
 
         overall_total_bytes = sum(table_sizes.values())
@@ -95,24 +113,26 @@ class MigrationUI:
         table_stats = {t: {"rows": 0, "bytes": 0} for t in tables}
         completed_tables = set()
 
-        def update_callback(table_name, rows, bytes_size=0, skipped=False):
+        def update_callback(table_name, rows, bytes_size=0, skipped=False, chunk_idx=None, total_chunks=None):
             if table_name not in tasks:
                 return
 
             task_id = tasks[table_name]
 
             if skipped:
-                cur_total = progress.tasks[task_id].total or bytes_size
+                cur_total = total_chunks or progress.tasks[task_id].total or 1
                 progress.update(
                     task_id,
-                    description=f"[grey50]Table: {table_name} (Skipped - Done)[/grey50]",
+                    description=f"[grey50]Table: {table_name} (추출완료)[/grey50]" if is_extract else f"[grey50]Table: {table_name} (적재완료)[/grey50]",
                     completed=cur_total,
                     total=cur_total,
+                    completed_bytes=bytes_size,
+                    chunk_str="Skipped"
                 )
                 if table_name not in completed_tables:
                     completed_tables.add(table_name)
                     if overall_total_bytes > 0:
-                        progress.advance(total_task, advance=cur_total)
+                        progress.advance(total_task, advance=bytes_size)
                     else:
                         progress.advance(total_task, advance=1)
                 return
@@ -122,12 +142,31 @@ class MigrationUI:
 
             completed_bytes = table_stats[table_name]["bytes"]
 
-            # total 수치가 지정되어 있지 않았을 경우 자동 상향 동적 조정
-            cur_task_total = progress.tasks[task_id].total
-            if cur_task_total is None or completed_bytes > cur_task_total:
-                progress.update(task_id, completed=completed_bytes, total=completed_bytes)
+            if chunk_idx is not None:
+                if chunk_idx == 0:
+                    desc = f"Table: {table_name} (용량계산중...)" if is_extract else f"Table: {table_name} (적재준비중...)"
+                    chunk_str = ""
+                    completed = 0
+                else:
+                    desc = f"Table: {table_name} (추출중...)" if is_extract else f"Table: {table_name} (적재중...)"
+                    if total_chunks is not None:
+                        chunk_str = f"{done_verb} chunk {chunk_idx}/{total_chunks}"
+                    else:
+                        chunk_str = f"{done_verb} chunk {chunk_idx}"
+                    completed = chunk_idx
             else:
-                progress.update(task_id, completed=completed_bytes)
+                desc = f"Table: {table_name} (추출중...)" if is_extract else f"Table: {table_name} (적재중...)"
+                chunk_str = ""
+                completed = progress.tasks[task_id].completed
+
+            progress.update(
+                task_id,
+                description=desc,
+                completed=completed,
+                total=total_chunks if total_chunks is not None else progress.tasks[task_id].total,
+                completed_bytes=completed_bytes,
+                chunk_str=chunk_str
+            )
 
             if overall_total_bytes > 0:
                 progress.advance(total_task, advance=bytes_size)
@@ -138,10 +177,13 @@ class MigrationUI:
             for table in tables:
                 if table not in completed_tables:
                     final_bytes = table_stats[table]["bytes"]
+                    task_total = progress.tasks[tasks[table]].total or 1
                     progress.update(
                         tasks[table],
-                        completed=final_bytes,
-                        total=final_bytes,
+                        description=f"[bold green]Table: {table} (추출완료)[/bold green]" if is_extract else f"[bold green]Table: {table} (적재완료)[/bold green]",
+                        completed=task_total,
+                        total=task_total,
+                        completed_bytes=final_bytes,
                     )
 
     def display_validation_report(self, results: dict, mismatch_log_path: str):

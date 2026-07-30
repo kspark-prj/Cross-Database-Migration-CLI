@@ -30,7 +30,7 @@ VeloxDB는 Python 기반으로 작성된 초고속, OOM 방지(Out-Of-Memory Saf
 ### 4. 시각화 스키마 DDL 적용 및 로그 컨트롤 (Unlogged/Nologging)
 
 - **트리 구조 스키마 DDL 적용**: Phase 2의 `prepare_schema` 단계에서 대상 테이블, 컬럼 수, UNLOGGED 설정 여부, 재실행 시 기존 데이터 초기화(TRUNCATE CASCADE / DELETE) 상태를 리치 트리(Tree) UI 형태로 시각화하여 한눈에 파악할 수 있습니다.
-- **DDL 디커플링**: 스키마 생성 시 인덱스와 FK 생성을 뒤로 연기하고, 뼈대(Skeletal) 테이블과 PK만 먼저 생성하여 원본 데이터 삽입을 최고 속도로 진행합니다.
+- **DDL 디커플링**: 스키마 생성 시 인덱스와 FK 생성을 뒤로 연기하고, 뼈대(Skeletal) 테이블 and PK만 먼저 생성하여 원본 데이터 삽입을 최고 속도로 진행합니다.
 - **트랜잭션 로그 최적화**: 적재 시 대상 DB 트랜잭션 로그(WAL/Redo/Undo) 폭주를 막기 위해 PostgreSQL `UNLOGGED TABLE`, Oracle `NOLOGGING` 옵션을 적용합니다.
 - **자동 시퀀스/PK 최적화**: 적재 완료 후 인덱스/FK를 일괄 복원하며, PostgreSQL 시퀀스, MySQL `AUTO_INCREMENT`, Oracle Identity 최댓값을 최종 적재된 데이터 값에 맞춰 자동 보정합니다. (복합 PK 테이블 시퀀스 보정 시 수치형 컬럼만 스마트하게 선별하여 처리)
 
@@ -44,7 +44,13 @@ VeloxDB는 Python 기반으로 작성된 초고속, OOM 방지(Out-Of-Memory Saf
 - **Oracle**: `SUM(to_number(substr(standard_hash(to_char(pk), 'MD5'), 1, 8), 'XXXXXXXX'))` (복합 PK는 `CAST(pk1 AS VARCHAR2(4000)) || CAST(pk2 AS VARCHAR2(4000))` 형식)
 - **Python/DuckDB**: `CAST(('0x' || substring(md5(CAST(pk AS VARCHAR)), 1, 8)) AS UBIGINT)` (복합 PK는 `CAST(pk1 AS VARCHAR) || CAST(pk2 AS VARCHAR)` 형식)
 - **SQLAlchemy Inspector 연동**: Target DB에 실제로 생성된 인덱스 목록을 `inspect(engine)`을 통해 동적으로 수집하고 Source 메타데이터 인덱스 수와 일치하는지 자동으로 교차 검증합니다.
-- **차이점 핀포인트 추적**: 불일치 청크 발견 시 로컬 Parquet 파일 데이터와 대상 DB 데이터를 로컬 메모리에 올려 정밀 **Polars Diff** 검증을 수행하고, 최대 10건의 핀포인트 mismatch 상세 내역을 `mismatch_log.json`에 기록합니다. 복합 PK 테이블도 **Polars의 다중 컬럼 Join 및 Expression 매칭**을 통해 메모리 효율적이고 정확하게 차이점을 추적하고 기록합니다.
+- ** 차이점 핀포인트 추적**: 불일치 청크 발견 시 로컬 Parquet 파일 데이터와 대상 DB 데이터를 로컬 메모리에 올려 정밀 **Polars Diff** 검증을 수행하고, 최대 10건의 핀포인트 mismatch 상세 내역을 `mismatch_log.json`에 기록합니다. 복합 PK 테이블도 **Polars의 다중 컬럼 Join 및 Expression 매칭**을 통해 메모리 효율적이고 정확하게 차이점을 추적하고 기록합니다.
+
+### 6. 청크 단위 진척도 & 소요시간(Elapsed) 통합 시각화
+
+- **청크 기반 진척율 보정**: Progress Bar의 진행 기준을 바이트 크기가 아닌 **처리된 청크 개수** 단위로 정렬하여 진척 상황에 부합하는 퍼센트(%) 진행률이 실시간 반영되도록 보정했습니다.
+- **고도화된 Rich UI 구성**: 진행 정보가 화면을 어지럽히지 않도록 개별 텍스트 로그를 Progress Bar에 완전 통합하고, 실시간 진행 상태(예: `(용량계산중...)`, `(추출중...)`, `(적재중...)`, `(추출완료 - 12.34초)`) 및 커스텀 컬럼을 통해 처리 청크 수(`Extracted chunk 82/500`)와 현재 누적 저장 용량(`92.96 MB`)을 한 줄에 통합 제공합니다.
+- **정밀 구간별 소요시간(Elapsed Time) 출력**: 메타데이터 추출, 사전 조사, 병렬 추출, 스키마 적용, 벌크 적재, 인덱스 복원, 오프라인 무결성 검증, 임시 파일 클린업 등 모든 마이그레이션 세션에 대한 구간 소요시간을 정밀하게 측정하여 요약 리포트합니다.
 
 ---
 
@@ -111,7 +117,27 @@ python main.py --mode load --target-uri "postgresql://postgres:root@127.0.0.1:54
 
 ```
 
-#### 🖥️ Phase 2 스키마 생성 및 초기화 콘솔 출력 예시
+#### 🖥️ Phase 1 추출 진행 상황 콘솔 출력 예시
+
+```text
+Extracting database metadata and structures...
+🔍 DDL Metadata | Table: batch_checkpoints             (5 cols, PK: id)
+🔍 DDL Metadata | Table: bulk_test_users               (8 cols, PK: id)
+✓ Database metadata extracted successfully (Elapsed: 0.85s)
+
+Discovered 2 tables to extract.
+Pre-scanning tables to estimate total rows...
+  📊 Table: batch_checkpoints             | Rows: 4
+  📊 Table: bulk_test_users               | Rows: 50,000,000
+Total estimated rows to extract: 50,000,004 (Pre-scan took 1.12s)
+
+Table: batch_checkpoints (추출완료 - 0.05초) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% Extracted chunk 1/1 0.00 MB
+Table: bulk_test_users (추출중...) ━━━━━━━━━━╸━━━━━━━━━━━━━━━━━━━  16% Extracted chunk 82/500 92.96 MB
+[bold yellow]Overall Progress[/bold yellow] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100%
+✓ Extraction phase completed! Parquet files and metadata stored successfully. (Elapsed: 45.23s)
+```
+
+#### 🖥️ Phase 2 스키마 생성 및 적재 진행 상황 콘솔 출력 예시
 
 ```text
 Step 1/4: Applying skeletal schema DDL...
@@ -122,9 +148,18 @@ Step 1/4: Applying skeletal schema DDL...
  📦 Table: bulk_test_users
    └── 🏗️ Created Table (UNLOGGED) (8 columns)
 
-✓ Skeletal tables created.
+✓ Skeletal tables created. (Elapsed: 2.14s)
 
-```
+Step 2/4: Bulk loading data chunks into Target DB...
+
+Total data volume to load: 594.30 MB
+  📦 Table: batch_checkpoints             | Size: 0.00 MB
+  📦 Table: bulk_test_users               | Size: 594.30 MB
+
+Table: batch_checkpoints (적재완료 - 0.02초) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% Loaded chunk 1/1 0.00 MB
+Table: bulk_test_users (적재중...) ━━━━━━━━━━━━━━━━━━━╸━━━━━━━━━━━  50% Loaded chunk 250/500 297.15 MB
+[bold yellow]Overall Progress[/bold yellow] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100%
+✓ Bulk loading completed. (Elapsed: 56.78s)
 
 ---
 

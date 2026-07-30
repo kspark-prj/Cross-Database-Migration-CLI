@@ -94,8 +94,12 @@ class DBExtractor:
                 for col in inspector.get_columns(table)
             ]
 
+            from rich.console import Console
+            console = Console()
             pk_info = inspector.get_pk_constraint(table)
             pk = pk_info.get("constrained_columns", [])
+            pk_status = f"PK: {', '.join(pk)}" if pk else "No PK"
+            console.print(f"  🔍 [bold cyan]DDL Metadata[/bold cyan] | Table: [yellow]{table:<30}[/yellow] ({len(columns)} cols, {pk_status})")
 
             indexes = [
                 {
@@ -255,6 +259,24 @@ class DBExtractor:
             except Exception:
                 is_splittable = False
 
+        if ui_progress_callback:
+            if is_splittable:
+                ui_progress_callback(
+                    table,
+                    0,
+                    0,
+                    chunk_idx=0,
+                    total_chunks=len(ranges)
+                )
+            else:
+                ui_progress_callback(
+                    table,
+                    0,
+                    0,
+                    chunk_idx=0,
+                    total_chunks=None
+                )
+
         if not is_splittable:
             self._extract_table_stream(table, columns, table_dir, ui_progress_callback)
             return
@@ -391,7 +413,13 @@ class DBExtractor:
             self._save_progress()
 
             if ui_progress_callback:
-                ui_progress_callback(table, rows_fetched, file_size)
+                ui_progress_callback(
+                    table,
+                    rows_fetched,
+                    file_size,
+                    chunk_idx=idx + 1,
+                    total_chunks=len(ranges)
+                )
 
             if self.delay_ms > 0:
                 time.sleep(self.delay_ms / 1000.0)
@@ -450,7 +478,13 @@ class DBExtractor:
                 self._save_progress()
 
                 if ui_progress_callback:
-                    ui_progress_callback(table, df.height, file_size)
+                    ui_progress_callback(
+                        table,
+                        df.height,
+                        file_size,
+                        chunk_idx=chunk_idx + 1,
+                        total_chunks=None
+                    )
 
                 chunk_idx += 1
 
