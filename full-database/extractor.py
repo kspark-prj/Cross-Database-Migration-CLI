@@ -130,8 +130,6 @@ class DBExtractor:
             }
 
             col_lines = [f"  {c['name']} {c['type']}" for c in columns]
-            if pk:
-                col_lines.append(f"  PRIMARY KEY ({', '.join(pk)})")
             schema_ddl_parts.append(f"CREATE TABLE {table} (\n" + ",\n".join(col_lines) + "\n);")
 
         with open(self.metadata_path, "wb") as f:

@@ -6,6 +6,8 @@ import duckdb
 import orjson
 from sqlalchemy import create_engine, text
 
+from converter import DialectConverter
+
 
 class DBLoader:
     def __init__(
@@ -291,3 +293,106 @@ class DBLoader:
                 rows=accumulated_rows,
                 finished=True,
             )
+
+    def apply_post_load_ddl(self):
+        """데이터 적재 완료 후 PK, 인덱스, FK 제약조건을 생성한다.
+        metadata.json에서 각 테이블의 primary_keys / indexes / foreign_keys 정보를 읽어
+        DialectConverter를 통해 Target Dialect에 맞는 DDL을 생성·실행한다.
+        실행 순서: PK → 인덱스 → FK
+        """
+        if not os.path.exists(self.metadata_path):
+            print("⚠️  [Post-Load DDL] metadata.json이 없어 PK/인덱스/FK 생성을 건너뜁니다.")
+            return
+
+        try:
+            with open(self.metadata_path, "rb") as f:
+                metadata = orjson.loads(f.read())
+        except Exception as e:
+            print(f"⚠️  [Post-Load DDL] metadata.json 로드 실패: {e}")
+            return
+
+        raw_target_dialect = getattr(self.config, "dialect", "postgres")
+        target_dialect = self._normalize_dialect(raw_target_dialect)
+        converter = DialectConverter(
+            source_dialect=self.source_dialect,
+            target_dialect=target_dialect,
+        )
+
+        # DDL 항목을 (category, label, ddl) 튜플로 수집
+        ddl_items = []
+
+        # ── 1. PK 제약조건 ──────────────────────────────────────────────
+        for table_name, table_meta in metadata.items():
+            if table_name.startswith("__"):
+                continue
+            pks = table_meta.get("primary_keys", [])
+            if pks:
+                pk_label = f"{table_name} ({', '.join(pks)})"
+                for ddl in converter.generate_pk_ddls(table_name, pks):
+                    ddl_items.append(("PK", pk_label, ddl))
+
+        # ── 2. 인덱스 ──────────────────────────────────────────────────
+        for table_name, table_meta in metadata.items():
+            if table_name.startswith("__"):
+                continue
+            indexes = table_meta.get("indexes", [])
+            for idx in indexes:
+                idx_name = idx.get("name", "unnamed")
+                cols = idx.get("columns", [])
+                if not cols:
+                    continue
+                if str(idx_name).upper() == "PRIMARY":
+                    continue
+                idx_label = f"{idx_name} ON {table_name} ({', '.join(cols)})"
+                for ddl in converter.generate_index_ddls(table_name, [idx]):
+                    ddl_items.append(("INDEX", idx_label, ddl))
+
+        # ── 3. FK 제약조건 ──────────────────────────────────────────────
+        for table_name, table_meta in metadata.items():
+            if table_name.startswith("__"):
+                continue
+            fks = table_meta.get("foreign_keys", [])
+            for fk in fks:
+                fk_name = fk.get("name", "unnamed")
+                ref_table = fk.get("referred_table", "?")
+                fk_label = f"{fk_name} ON {table_name} → {ref_table}"
+                for ddl in converter.generate_fk_ddls(table_name, [fk]):
+                    ddl_items.append(("FK", fk_label, ddl))
+
+        if not ddl_items:
+            print("ℹ️  [Post-Load DDL] 생성할 PK/인덱스/FK가 없습니다.")
+            return
+
+        # 카테고리별 개수 집계
+        pk_count = sum(1 for c, _, _ in ddl_items if c == "PK")
+        idx_count = sum(1 for c, _, _ in ddl_items if c == "INDEX")
+        fk_count = sum(1 for c, _, _ in ddl_items if c == "FK")
+
+        print(
+            f"🔧 [Post-Load DDL] PK {pk_count}개, "
+            f"인덱스 {idx_count}개, "
+            f"FK 제약조건 {fk_count}개 생성 시작..."
+        )
+
+        engine = create_engine(self.config.get_sqlalchemy_url())
+        success_count = 0
+        skip_count = 0
+        try:
+            with engine.begin() as conn:
+                for category, label, ddl in ddl_items:
+                    try:
+                        conn.execute(text(ddl))
+                        success_count += 1
+                        print(f"  ✓ [{category:>5}] {label}")
+                    except Exception as ddl_err:
+                        # 이미 존재하는 PK/인덱스/FK는 무시 (중복 실행 안전)
+                        skip_count += 1
+                        print(f"  ⊘ [{category:>5}] {label}  (스킵: 이미 존재)")
+        finally:
+            engine.dispose()
+
+        print(
+            f"✅ [Post-Load DDL] 완료 — 성공: {success_count}개"
+            + (f", 스킵(이미 존재): {skip_count}개" if skip_count else "")
+        )
+

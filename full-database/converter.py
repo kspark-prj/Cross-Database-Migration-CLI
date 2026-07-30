@@ -67,8 +67,8 @@ class DialectConverter:
         except Exception:
             return src_type
 
-    def generate_skeleton_ddl(self, table_name: str, columns: list, primary_keys: list) -> str:
-        """Generates DDL to create table with Primary Keys, without extra indexes/FKs."""
+    def generate_skeleton_ddl(self, table_name: str, columns: list, primary_keys: list = None) -> str:
+        """Generates DDL to create table with columns only, without PK/indexes/FKs."""
         col_defs = []
         for col in columns:
             name = col["name"]
@@ -115,9 +115,10 @@ class DialectConverter:
             col_def = " ".join(col_def.split())
             col_defs.append(col_def)
 
-        if primary_keys:
-            pk_cols = ", ".join(f'"{pk}"' for pk in primary_keys)
-            col_defs.append(f"PRIMARY KEY ({pk_cols})")
+        # PK는 데이터 적재 후 apply_post_load_ddl에서 생성
+        # if primary_keys:
+        #     pk_cols = ", ".join(f'"{ pk}"' for pk in primary_keys)
+        #     col_defs.append(f"PRIMARY KEY ({pk_cols})")
 
         ddl = f'CREATE TABLE "{table_name}" (\n  ' + ",\n  ".join(col_defs) + "\n);"
 
@@ -127,6 +128,20 @@ class DialectConverter:
             pass
 
         return ddl
+
+    def generate_pk_ddls(self, table_name: str, primary_keys: list) -> list:
+        """Generates ALTER TABLE ... ADD PRIMARY KEY DDL for post-load execution."""
+        if not primary_keys:
+            return []
+
+        if self.target == "mysql":
+            pk_cols = ", ".join(f"`{pk}`" for pk in primary_keys)
+            ddl = f"ALTER TABLE `{table_name}` ADD PRIMARY KEY ({pk_cols});"
+        else:
+            pk_cols = ", ".join(f'"{pk}"' for pk in primary_keys)
+            ddl = f'ALTER TABLE "{table_name}" ADD PRIMARY KEY ({pk_cols});'
+
+        return [ddl]
 
     def generate_index_ddls(self, table_name: str, indexes: list) -> list:
         ddls = []

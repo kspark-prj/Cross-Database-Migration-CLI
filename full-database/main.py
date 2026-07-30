@@ -53,7 +53,9 @@ class FileProgressColumn(ProgressColumn):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="VeloxDB Cross-Database Migration & Validation CLI")
+    parser = argparse.ArgumentParser(
+        description="VeloxDB Cross-Database Migration & Validation CLI"
+    )
 
     parser.add_argument(
         "--mode",
@@ -111,7 +113,9 @@ def parse_args():
     return parser.parse_args()
 
 
-def detect_source_dialect(data_dir: str, target_dialect: str, fallback_source_uri: str = None) -> str:
+def detect_source_dialect(
+    data_dir: str, target_dialect: str, fallback_source_uri: str = None
+) -> str:
     meta_path = os.path.join(data_dir, "metadata.json")
     if os.path.exists(meta_path):
         try:
@@ -154,7 +158,9 @@ def display_header(mode, target_dialect, source_dialect, output_dir):
 def run_extract_phase(args):
     console.print("[bold yellow]🚀 Starting Data Extraction Phase...[/bold yellow]")
     # 💡 콘솔에 ConnectorX + Polars 엔진 사용 명시
-    console.print("[bold yellow]⚡ Engine: ConnectorX (C/Rust Native) + Polars (Apache Arrow)[/bold yellow]\n")
+    console.print(
+        "[bold yellow]⚡ Engine: ConnectorX (C/Rust Native) + Polars (Apache Arrow)[/bold yellow]\n"
+    )
     console.print(
         "[bold yellow]⚡ [ ConnectorX가 Rust 엔진으로 DB에서 데이터를 가장 빠르게 뽑아오면, Polars가 Arrow 메모리 구조를 이용해 복사 과정 없이 즉시 Parquet 파일로 저장 ][/bold yellow]\n"
     )
@@ -177,7 +183,9 @@ def run_extract_phase(args):
             console.print("[yellow]⚠️ No tables found to extract.[/yellow]")
             return
 
-        console.print(f"📦 [bold green]Found {len(tables)} table(s) to extract:[/bold green] {', '.join(tables)}\n")
+        console.print(
+            f"📦 [bold green]Found {len(tables)} table(s) to extract:[/bold green] {', '.join(tables)}\n"
+        )
 
         ui = MigrationUI()
 
@@ -187,7 +195,9 @@ def run_extract_phase(args):
                     meta = metadata[table_name]
 
                     # Extractor 콜백 연결
-                    def extract_cb(tbl, rows=0, bytes_size=0, finished=False, skipped=False, **kwargs):
+                    def extract_cb(
+                        tbl, rows=0, bytes_size=0, finished=False, skipped=False, **kwargs
+                    ):
                         update_callback(
                             table_name=tbl,
                             rows=rows,
@@ -208,7 +218,9 @@ def run_extract_phase(args):
                     tbl, success, err_msg = future.result()
                     if not success:
                         failed_tables.append((tbl, err_msg))
-                        console.print(f"\n[bold red]✗ Failed to extract table {tbl}:[/bold red] {err_msg}")
+                        console.print(
+                            f"\n[bold red]✗ Failed to extract table {tbl}:[/bold red] {err_msg}"
+                        )
 
         start_time = time.time()
         ui.run_with_progress(
@@ -218,7 +230,9 @@ def run_extract_phase(args):
             run_fn=extraction_task,
         )
         elapsed = time.time() - start_time
-        console.print(f"\n[bold green]✓ Extraction phase completed! (Elapsed: {elapsed:.2f}s)[/bold green]\n")
+        console.print(
+            f"\n[bold green]✓ Extraction phase completed! (Elapsed: {elapsed:.2f}s)[/bold green]\n"
+        )
 
     except Exception as e:
         console.print(f"[bold red]❌ Extraction Phase Critical Error:[/bold red] {e}")
@@ -226,6 +240,7 @@ def run_extract_phase(args):
 
 
 def run_load_phase(args, target_config, source_dialect):
+
     loader = DBLoader(
         db_config=target_config,
         data_dir=args.output_dir,
@@ -242,7 +257,9 @@ def run_load_phase(args, target_config, source_dialect):
         console.print(f"[bold yellow]⚠️  No tables found to load in[/bold yellow] {args.output_dir}")
         return
 
-    console.print(f"📦 [bold green]Found {len(tables)} table(s) to load:[/bold green] {', '.join(tables)}\n")
+    console.print(
+        f"📦 [bold green]Found {len(tables)} table(s) to load:[/bold green] {', '.join(tables)}\n"
+    )
 
     start_time = time.time()
 
@@ -328,9 +345,20 @@ def run_load_phase(args, target_config, source_dialect):
 
     elapsed = time.time() - start_time
     if failed_tables:
-        console.print(f"\n[bold red]❌ Loading completed with {len(failed_tables)} errors! (Elapsed: {elapsed:.2f}s)[/bold red]")
+        console.print(
+            f"\n[bold red]❌ Loading completed with {len(failed_tables)} errors! (Elapsed: {elapsed:.2f}s)[/bold red]"
+        )
     else:
-        console.print(f"\n[bold green]✓ Loading phase completed successfully! (Elapsed: {elapsed:.2f}s)[/bold green]\n")
+        console.print(
+            f"\n[bold green]✓ Loading phase completed successfully! (Elapsed: {elapsed:.2f}s)[/bold green]"
+        )
+
+    # ── Post-Load: 인덱스 및 FK 제약조건 생성 (데이터 적재 후) ──
+    console.print(
+        "\n[bold yellow]🔧 Applying Post-Load DDL (Primary Keys, Indexes & Foreign Keys)...[/bold yellow]"
+    )
+    loader.apply_post_load_ddl()
+    console.print("")
 
 
 def run_validation_phase(args, target_config):
@@ -361,7 +389,10 @@ def run_validation_phase(args, target_config):
             else:
                 all_valid = False
                 status_str = f"[red]{status.upper()}[/red]"
-                details = res.get("reason", f"Src: {res.get('source_rows', 0):,} / Tgt: {res.get('target_rows', 0):,}")
+                details = res.get(
+                    "reason",
+                    f"Src: {res.get('source_rows', 0):,} / Tgt: {res.get('target_rows', 0):,}",
+                )
 
             table.add_row(tbl_name, status_str, details)
 
@@ -385,7 +416,9 @@ def main():
         sys.exit(1)
 
     if args.mode in ["load", "validate", "all"] and not args.target_uri:
-        console.print("[bold red]Error: --target-uri is required for 'load' / 'validate' / 'all' mode.[/bold red]")
+        console.print(
+            "[bold red]Error: --target-uri is required for 'load' / 'validate' / 'all' mode.[/bold red]"
+        )
         sys.exit(1)
 
     target_config = None
