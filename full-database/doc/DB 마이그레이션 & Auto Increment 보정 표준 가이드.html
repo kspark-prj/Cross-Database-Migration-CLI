@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DB 마이그레이션 & Auto Increment 보정 통합 가이드라인</title>
+    <style>
+        :root {
+            --bg-color: #f8fafc;
+            --card-bg: #ffffff;
+            --text-main: #1e293b;
+            --text-sub: #64748b;
+            --border-color: #e2e8f0;
+            --pg-color: #336791;
+            --mysql-color: #00758f;
+            --oracle-color: #c7254e;
+            --mssql-color: #cc292b;
+            --accent-green: #10b981;
+            --accent-blue: #3b82f6;
+            --accent-amber: #f59e0b;
+            --accent-purple: #8b5cf6;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            text-align: center;
+            color: #0f172a;
+            margin-bottom: 8px;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: var(--text-sub);
+            margin-bottom: 30px;
+        }
+
+        /* 공통 헤더 스타일 */
+        .section-title {
+            font-size: 1.25rem;
+            color: #0f172a;
+            margin-top: 30px;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        /* 사전 체크리스트 & 절차 박스 (4단계 대응) */
+        .grid-4 {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+            gap: 16px;
+            margin-bottom: 25px;
+        }
+
+        .card {
+            background: var(--card-bg);
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid var(--border-color);
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);
+        }
+
+        .card h3 {
+            margin-top: 0;
+            font-size: 1rem;
+            color: #0f172a;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .step-badge {
+            color: white;
+            font-size: 0.75rem;
+            font-weight: bold;
+            padding: 2px 8px;
+            border-radius: 12px;
+        }
+
+        .step-badge.s1 { background: var(--accent-blue); }
+        .step-badge.s2 { background: var(--accent-amber); }
+        .step-badge.s3 { background: var(--accent-green); }
+        .step-badge.s4 { background: var(--accent-purple); }
+
+        ul.check-list {
+            padding-left: 18px;
+            margin: 0;
+            font-size: 0.88rem;
+            color: #475569;
+        }
+
+        ul.check-list li {
+            margin-bottom: 6px;
+        }
+
+        /* DB 그리드 카드 */
+        .db-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+            gap: 20px;
+        }
+
+        @media (max-width: 600px) {
+            .db-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .db-card {
+            background: var(--card-bg);
+            border-radius: 12px;
+            padding: 24px;
+            border-top: 5px solid #ccc;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+            border-left: 1px solid var(--border-color);
+            border-right: 1px solid var(--border-color);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .db-card.postgresql { border-top-color: var(--pg-color); }
+        .db-card.mysql { border-top-color: var(--mysql-color); }
+        .db-card.oracle { border-top-color: var(--oracle-color); }
+        .db-card.mssql { border-top-color: var(--mssql-color); }
+
+        .db-title {
+            font-size: 1.3rem;
+            font-weight: bold;
+            margin-bottom: 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .db-card.postgresql .db-title { color: var(--pg-color); }
+        .db-card.mysql .db-title { color: var(--mysql-color); }
+        .db-card.oracle .db-title { color: var(--oracle-color); }
+        .db-card.mssql .db-title { color: var(--mssql-color); }
+
+        .db-content h4 {
+            margin: 14px 0 6px 0;
+            color: #0f172a;
+            font-size: 0.95rem;
+        }
+
+        .db-content p {
+            margin: 0 0 8px 0;
+            color: #475569;
+            font-size: 0.9rem;
+        }
+
+        code {
+            background: #f1f5f9;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: Consolas, Monaco, monospace;
+            font-size: 0.85rem;
+            color: #0f172a;
+        }
+
+        .code-block {
+            background: #0f172a;
+            color: #f8fafc;
+            padding: 12px;
+            border-radius: 6px;
+            font-family: Consolas, Monaco, monospace;
+            font-size: 0.82rem;
+            overflow-x: auto;
+            margin-top: 6px;
+            line-height: 1.4;
+        }
+
+        .tag {
+            font-size: 0.75rem;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+            background: #f1f5f9;
+            color: #334155;
+        }
+
+        .warning-box {
+            background: #fffbebf8;
+            border-left: 4px solid var(--accent-amber);
+            padding: 14px;
+            border-radius: 0 8px 8px 0;
+            margin-top: 10px;
+            font-size: 0.88rem;
+            color: #92400e;
+        }
+
+        .summary-box {
+            background: #f0fdf4;
+            border-left: 4px solid var(--accent-green);
+            padding: 18px;
+            border-radius: 0 8px 8px 0;
+            margin-top: 35px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>🚀 DB 마이그레이션 & Auto Increment 보정 표준 가이드</h1>
+    <p class="subtitle">데이터 손실 Zero · 최고 이관 속도 보장 · 채번 충돌 방지 실무 가이드라인</p>
+
+    <!-- 1. 이관 프로세스 4단계 -->
+    <h2 class="section-title">📌 엔터프라이즈 데이터 이관 4단계 표준 절차</h2>
+    <div class="grid-4">
+        <div class="card">
+            <h3><span>1. 사전 준비</span> <span class="step-badge s1">STEP 1</span></h3>
+            <ul class="check-list">
+                <li>소스 DB 사전 <code>VACUUM</code>으로 WAL 및 Hint Bits 정리</li>
+                <li>소스 데이터 건수(Count) 및 PK Checksum 메타데이터 기록</li>
+                <li>타겟 DB에 PK/FK/인덱스를 뺀 <strong>'순수 정수 컬럼'</strong>으로 타겟 테이블 생성</li>
+            </ul>
+        </div>
+        <div class="card">
+            <h3><span>2. 대량 데이터 적재</span> <span class="step-badge s2">STEP 2</span></h3>
+            <ul class="check-list">
+                <li>Parquet/Dump 파일을 타겟 DB에 병렬 적재</li>
+                <li>적재 중 트랜잭션 로그/Undo 영역 모니터링</li>
+                <li>제약조건이 제거된 상태이므로 병목 없이 최고 속도 이관 달성</li>
+            </ul>
+        </div>
+        <div class="card">
+            <h3><span>3. 구조 완성 및 보정</span> <span class="step-badge s3">STEP 3</span></h3>
+            <ul class="check-list">
+                <li>타겟 테이블에 PK, UNIQUE, Foreign Key 제약조건 추가</li>
+                <li>ID 컬럼에 <code>IDENTITY</code> / <code>AUTO_INCREMENT</code> 속성 부여</li>
+                <li><strong>시퀀스 번호를 현재 MAX(id) 값으로 반드시 동기화</strong></li>
+            </ul>
+        </div>
+        <div class="card">
+            <h3><span>4. 데이터 검증</span> <span class="step-badge s4">STEP 4</span></h3>
+            <ul class="check-list">
+                <li>소스 vs 타겟 레코드 건수(Count Check) 비교</li>
+                <li>extractor.py 기준 PK Checksum / 해시값 검증</li>
+                <li>신규 <code>INSERT</code> 테스트로 시퀀스 채번 정상 작동 확인</li>
+                <li>테이블 통계정보(Analyze) 갱신으로 최적화 완료</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- 2. DB별 스크립트 및 유의사항 -->
+    <h2 class="section-title">🗄️ DB별 마이그레이션 스크립트 및 특수 유의사항</h2>
+    
+    <div class="db-grid">
+
+        <!-- PostgreSQL -->
+        <div class="db-card postgresql">
+            <div class="db-title">
+                <span>PostgreSQL</span>
+                <span class="tag">IDENTITY / SERIAL</span>
+            </div>
+            <div class="db-content">
+                <h4>1. 이관 절차 스크립트</h4>
+                <div class="code-block">
+-- STEP 1: 타겟 테이블 DDL (순수 int4 생성)
+CREATE TABLE users (id INT4 NOT NULL, name VARCHAR(50));
+
+-- STEP 2: [데이터 Bulk 적재 진행 (Parquet -> DB)]
+
+-- STEP 3: PK 추가, IDENTITY 적용 및 시퀀스 동기화
+ALTER TABLE users ADD PRIMARY KEY (id);
+ALTER TABLE users ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY;
+
+SELECT setval(
+    pg_get_serial_sequence('users', 'id'), 
+    COALESCE(MAX(id), 1)
+) FROM users;
+
+-- STEP 4: 데이터 검증 및 통계정보 갱신
+SELECT COUNT(*) FROM users;
+ANALYZE users;
+                </div>
+
+                <div class="warning-box">
+                    <strong>⚠️ PostgreSQL 이관 유의사항:</strong><br>
+                    • `GENERATED ALWAYS` 대신 **`GENERATED BY DEFAULT`**를 써야 명시적 ID 주입 시 에러가 나지 않습니다.<br>
+                    • 대용량 이관 전 소스 DB에 `VACUUM`을 안 하면 덤프 중 WAL이 폭증하여 DB가 마비될 수 있습니다.
+                </div>
+            </div>
+        </div>
+
+        <!-- MySQL / InnoDB -->
+        <div class="db-card mysql">
+            <div class="db-title">
+                <span>MySQL (InnoDB)</span>
+                <span class="tag">AUTO_INCREMENT</span>
+            </div>
+            <div class="db-content">
+                <h4>1. 이관 절차 스크립트</h4>
+                <div class="code-block">
+-- STEP 1: 타겟 테이블 DDL (일반 INT 생성)
+CREATE TABLE users (id INT NOT NULL, name VARCHAR(50));
+
+-- STEP 2: [데이터 Bulk 적재 진행]
+
+-- STEP 3: PK 추가, AUTO_INCREMENT 변경 및 시작값 설정
+ALTER TABLE users ADD PRIMARY KEY (id);
+ALTER TABLE users MODIFY id INT AUTO_INCREMENT;
+
+-- MAX(id) 확인 후 그 다음 번호로 시작 설정
+SET @max_id = (SELECT IFNULL(MAX(id), 0) + 1 FROM users);
+SET @sql = CONCAT('ALTER TABLE users AUTO_INCREMENT = ', @max_id);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+-- STEP 4: 데이터 검증 및 통계정보 갱신
+SELECT COUNT(*) FROM users;
+ANALYZE TABLE users;
+                </div>
+
+                <div class="warning-box">
+                    <strong>⚠️ MySQL 이관 유의사항:</strong><br>
+                    • 대용량 적재 시 `UNIQUE_CHECKS=0;`, `FOREIGN_KEY_CHECKS=0;` 옵션을 잠시 끄면 적재 속도가 5배 이상 향상됩니다.<br>
+                    • `innodb_buffer_pool_size` 메모리 설정이 적절한지 미리 체크해야 합니다.
+                </div>
+            </div>
+        </div>
+
+        <!-- Oracle -->
+        <div class="db-card oracle">
+            <div class="db-title">
+                <span>Oracle</span>
+                <span class="tag">IDENTITY / SEQUENCE</span>
+            </div>
+            <div class="db-content">
+                <h4>1. 이관 절차 스크립트</h4>
+                <div class="code-block">
+-- STEP 1: 타겟 테이블 DDL
+CREATE TABLE users (id NUMBER(10) NOT NULL, name VARCHAR2(50));
+
+-- STEP 2: [데이터 Bulk 적재 진행]
+
+-- STEP 3: PK 추가 및 IDENTITY 시퀀스 한 번에 맞춤 (12c+)
+ALTER TABLE users ADD CONSTRAINT pk_users PRIMARY KEY (id);
+ALTER TABLE users MODIFY id 
+    GENERATED BY DEFAULT AS IDENTITY (START WITH LIMIT VALUE);
+
+-- STEP 4: 데이터 검증 및 통계정보 갱신
+SELECT COUNT(*) FROM users;
+EXEC DBMS_STATS.GATHER_TABLE_STATS(USER, 'USERS');
+                </div>
+
+                <div class="warning-box">
+                    <strong>⚠️ Oracle 이관 유의사항:</strong><br>
+                    • 대용량 적재 시 `NOLOGGING` 옵션 및 `APPEND` 힌트를 사용하면 Redo Log 생성을 최소화하여 이관 시간을 대폭 줄일 수 있습니다.<br>
+                    • `START WITH LIMIT VALUE` 구문을 활용하면 현재 테이블의 MAX 값으로 시퀀스가 자동 보정됩니다.
+                </div>
+            </div>
+        </div>
+
+        <!-- MS SQL Server -->
+        <div class="db-card mssql">
+            <div class="db-title">
+                <span>Microsoft SQL Server</span>
+                <span class="tag">IDENTITY / RESEED</span>
+            </div>
+            <div class="db-content">
+                <h4>1. 이관 절차 스크립트</h4>
+                <div class="code-block">
+-- STEP 1: 이미 IDENTITY 컬럼으로 만든 테이블에 입력을 허용해야 할 때
+SET IDENTITY_INSERT users ON;
+
+-- STEP 2: 데이터 Bulk Insert 진행 (명시적 ID 주입)
+INSERT INTO users (id, name) VALUES (1, '홍길동');
+
+SET IDENTITY_INSERT users OFF;
+
+-- STEP 3: IDENTITY 시퀀스 현재 MAX(id)에 맞게 보정
+DBCC CHECKIDENT ('users', RESEED);
+
+-- STEP 4: 데이터 검증 및 통계정보 갱신
+SELECT COUNT(*) FROM users;
+UPDATE STATISTICS users;
+                </div>
+
+                <div class="warning-box">
+                    <strong>⚠️ MS-SQL 이관 유의사항:</strong><br>
+                    • `IDENTITY_INSERT ON`은 세션당 한 번에 **하나의 테이블에만** 적용 가능하므로 순차적으로 세션을 열어 처리해야 합니다.<br>
+                    • 적재 중 Log File(.ldf)이 꽉 차지 않도록 복구 모델(Recovery Model)을 잠시 `SIMPLE`로 변경하는 것이 좋습니다.
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- 요약 박스 -->
+    <div class="summary-box">
+        <h3 style="margin-top:0; color:#15803d; font-size:1.1rem;">💡 가이드라인 요약</h3>
+        <p style="margin:0; color:#166534; font-size:0.92rem;">
+            엔터프라이즈 마이그레이션의 완벽한 마무리는 <strong>STEP 4 검증(Count & Checksum & 채번 확인)</strong>입니다. 이관 작업 후 레코드 수 및 해시값 일치 여부를 파악하고, 테스트 INSERT를 통해 시퀀스가 보정되었음을 입증해야 서비스 오픈 시 예상치 못한 PK 에러를 100% 예방할 수 있습니다.
+        </p>
+    </div>
+</div>
+
+</body>
+</html>
